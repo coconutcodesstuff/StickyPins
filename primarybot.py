@@ -1,3 +1,5 @@
+#TODO - Add json dir for storing stickied msgs
+#TODO - Add a permission denied embed msg cuz it looks good
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -9,7 +11,7 @@ from typing import Dict, Optional
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-OWNER_IDS = (1202369414721450005, 872007660587876372, 800570889082765323)  # your Discord IDs
+OWNER_IDS = (1202369414721450005, 872007660587876372, 800570889082765323)  # Mod Discord id for shut down cmd
 
 intents = discord.Intents.default()
 intents.messages = True
@@ -61,18 +63,18 @@ async def on_message(message: discord.Message):
                 await message.reply("❌ Cannot mark an empty message as solution!", mention_author=False)
                 return
 
-            # Prevent double execution from same message
+            # Prevent double execution of msgs
             await asyncio.sleep(0.5)
 
-            # If there's already a sticky message, confirm override
+            # If there's already a sticky message, then ask for a overide
             if thread.id in sticky_messages:
                 try:
                     prev_sticky_id = sticky_messages[thread.id]
-                    await thread.fetch_message(prev_sticky_id)  # Check if message exists
+                    await thread.fetch_message(prev_sticky_id)  # Confirm the msgs existence
                     await ask_override_confirmation(message.author, thread, replied_msg)
                     return
                 except discord.NotFound:
-                    pass  # allow creating new if previous deleted
+                    pass  # if there isnt then dont let the user continue and make a new sticky
 
             await create_sticky_message(thread, replied_msg, message.author)
             await message.reply("✅ Solution has been marked and pinned to the bottom!", mention_author=False)
@@ -80,7 +82,7 @@ async def on_message(message: discord.Message):
         except discord.NotFound:
             await message.reply("❌ Could not find the message you replied to!", mention_author=False)
         except discord.Forbidden:
-            await message.reply("❌ I don't have permission to manage messages in this thread!", mention_author=False)
+            await message.reply("❌ I don't have permission to manage messages in this thread!", mention_author=False) # quite self explanatory i think
         except Exception as e:
             print(f"Error in on_message: {e}")
             await message.reply("❌ An error occurred while processing your request.", mention_author=False)
@@ -240,6 +242,7 @@ async def shutdown(interaction: discord.Interaction):
         task.cancel()
     
     await bot.close()
+
 
 
 bot.run(TOKEN)

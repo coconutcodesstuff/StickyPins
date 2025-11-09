@@ -1,51 +1,269 @@
-#TODO - Add json dir for storing stickied msgs
-#TODO - Add a permission denied embed msg cuz it looks good
+# Rewrote everything with the help of my brain and a little gpt cuz it was lwk kinda ahh before
+# Called @bot.event 2 times even though I know its not best practice and the activity doesnt work because of it
+# Got the JSON db system working
+# Was too lazy to label the code, but it works!
+
 import discord
 from discord.ext import commands
-from discord import app_commands
 import asyncio
+import json
 import os
 from dotenv import load_dotenv
-from typing import Dict, Optional
+from datetime import datetime, timezone, timedelta
 
+# ------------- Config ----------
 load_dotenv()
-
 TOKEN = os.getenv("DISCORD_TOKEN")
-OWNER_IDS = (1202369414721450005, 872007660587876372, 800570889082765323)  # Mod Discord id for shut down cmd
+if not TOKEN:
+    raise SystemExit("DISCORD_TOKEN not found in environment (.env)")
+
+
+
+PARENT_CHANNEL_ID = 1407193062064787592
+OWNER_ID = 1202369414721450005
+DATA_FILE = "stickydata.json"
+REFRESH_INTERVAL = 8.0
+BACKOFF_INTERVAL = 10.0
+MAX_AGE_DAYS = 30
+LOG_LINES_LIMIT = 200
+CONSOLE_RETURN_LINES = 30
 
 intents = discord.Intents.default()
 intents.messages = True
 intents.message_content = True
 intents.guilds = True
 intents.members = True
-intents.typing = False
-intents.presences = False
 
-bot = commands.Bot(command_prefix="$", intents=intents)
-sticky_messages: Dict[int, int] = {}  # {thread_id: message_id}
-sticky_tasks: Dict[int, asyncio.Task] = {}  # Store tasks for cleanup
+bot = commands.Bot(command_prefix="-", intents=intents)
 
-
+#--------------Bot.Event------------------
 @bot.event
 async def on_ready():
+    activity = discord.Activity(
+        type=discord.ActivityType.playing,
+        name='Run "-sticky" in the help thread!'
+    )
+    await bot.change_presence(activity=activity)
     print(f"✅ Logged in as {bot.user}")
+
+# ------------- Runtime state -------------
+sticky_data = {}
+tasks = {}
+locks = {}
+console_logs = []
+
+
+# ------------- Helpers -------------
+def log(line: str):
+    clean = str(line).strip()
+    console_logs.append(clean)
+    if len(console_logs) > LOG_LINES_LIMIT:
+        del console_logs[0 : len(console_logs) - LOG_LINES_LIMIT]
+    print(clean)
+
+
+def load_data():
+    global sticky_data
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                sticky_data = json.load(f)
+        except Exception as e:
+            log(f"Failed to load {DATA_FILE}: {e}")
+            sticky_data = {}
+    else:
+        sticky_data = {}
+    cleaned = {}
+    for k, v in sticky_data.items():
+        try:
+            tk = str(int(k))
+        except Exception:
+            continue
+        if not isinstance(v, dict):
+            continue
+        cleaned[tk] = v
+    sticky_data = cleaned
+
+
+def save_data():
     try:
-        synced = await bot.tree.sync()
-        print(f"✅ Synced {len(synced)} slash command(s)")
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(sticky_data, f, indent=2, ensure_ascii=False)
     except Exception as e:
-        print(f"❌ Slash command sync failed: {e}")
-
-    await bot.change_presence(activity=discord.Game(name="Keeping solutions sticky!"))
+        log(f"Failed to save {DATA_FILE}: {e}")
 
 
+def iso_now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def iso_to_dt(iso_str: str):
+    try:
+        return datetime.fromisoformat(iso_str)
+    except Exception:
+        return None
+
+
+# ------------- Embed Builders -------------
+def make_solution_embed(content: str, asked_by_name: str):
+    desc = content if content else "(no text)"
+    emb = discord.Embed(
+        title="Solution To This Question", description=desc, color=discord.Color.gold()
+    )
+    emb.set_footer(text=f"Asked by {asked_by_name}")
+    return emb
+
+
+def make_jump_view(guild_id: int, channel_id: int, message_id: int):
+    view = discord.ui.View()
+    url = f"https://discord.com/channels/{guild_id}/{channel_id}/{message_id}"
+    view.add_item(discord.ui.Button(label="Jump to Solution", url=url, style=discord.ButtonStyle.link))
+    return view
+
+
+def make_permission_denied_embed(command_name: str, user: discord.User):
+    emb = discord.Embed(
+        title="Permission Denied",
+        description="You do not have permission to use this command!",
+        color=discord.Color.red(),
+    )
+    emb.set_footer(text=f"for command [{command_name}] • requested by {user.name}")
+    return emb
+
+
+# ------------- Core -------------
+async def create_sticky(thread: discord.Thread, original_msg: discord.Message, marker_name: str, pin_first_time=True):
+    emb = make_solution_embed(original_msg.content or "(no text)", original_msg.author.display_name)
+    view = make_jump_view(thread.guild.id, thread.id, original_msg.id)
+    try:
+        sent = await thread.send(embed=emb, view=view)
+    except Exception as e:
+        log(f"Failed to send sticky: {e}")
+        return None
+
+    if pin_first_time:
+        try:
+            await sent.pin()
+        except Exception:
+            pass
+
+    sticky_data[str(thread.id)] = {
+        "thread_id": str(thread.id),
+        "sticky_message_id": sent.id,
+        "original_message_id": original_msg.id,
+        "content": original_msg.content or "",
+        "marked_by": marker_name,
+        "timestamp": iso_now(),
+        "active": True,
+    }
+    save_data()
+    return sent
+
+
+async def delete_msg_if_exists(channel: discord.abc.Messageable, msg_id: int):
+    try:
+        msg = await channel.fetch_message(msg_id)
+        await msg.delete()
+    except Exception:
+        return
+
+
+async def refresh_cycle(thread_id_str: str):
+    lock = locks.setdefault(thread_id_str, asyncio.Lock())
+    interval = REFRESH_INTERVAL
+    while True:
+        entry = sticky_data.get(thread_id_str)
+        if not entry or not entry.get("active", False):
+            break
+        async with lock:
+            try:
+                thread = await bot.fetch_channel(int(thread_id_str))
+            except Exception:
+                entry["active"] = False
+                save_data()
+                break
+
+            async for m in thread.history(limit=1):
+                last_msg = m
+                break
+            else:
+                last_msg = None
+
+            sticky_msg_id = entry.get("sticky_message_id")
+            if last_msg is None or last_msg.id == sticky_msg_id:
+                await asyncio.sleep(interval)
+                continue
+
+            if sticky_msg_id:
+                await delete_msg_if_exists(thread, sticky_msg_id)
+
+            emb = make_solution_embed(entry.get("content", "(no text)"), entry.get("marked_by", "Unknown"))
+            view = make_jump_view(thread.guild.id, thread.id, entry.get("original_message_id"))
+            try:
+                new_msg = await thread.send(embed=emb, view=view)
+                entry["sticky_message_id"] = new_msg.id
+                entry["timestamp"] = iso_now()
+                save_data()
+            except Exception as e:
+                log(f"Repost error: {e}")
+        await asyncio.sleep(interval)
+
+
+# ------------- Confirmation helper (now in embeds) -------------
+async def ask_replace_confirmation(author: discord.Member):
+    emb = discord.Embed(
+        title="Confirm Sticky Replacement",
+        description="⚠️ You are about to replace a sticky that already exists in a thread.\n\nReact with ✅ to confirm or ❌ to cancel.",
+        color=discord.Color.orange(),
+    )
+    try:
+        msg = await author.send(embed=emb)
+    except Exception:
+        return False
+    await msg.add_reaction("✅")
+    await msg.add_reaction("❌")
+
+    def check(reaction, user):
+        return user == author and str(reaction.emoji) in ["✅", "❌"] and reaction.message.id == msg.id
+
+    try:
+        reaction, _ = await bot.wait_for("reaction_add", check=check, timeout=60.0)
+        if str(reaction.emoji) == "✅":
+            confirm_emb = discord.Embed(description="✅ Replacing the sticky!", color=discord.Color.green())
+            await author.send(embed=confirm_emb)
+            return True
+        else:
+            cancel_emb = discord.Embed(description="❎ Cancelled Sticky Change Request!", color=discord.Color.red())
+            await author.send(embed=cancel_emb)
+            return False
+    except asyncio.TimeoutError:
+        timeout_emb = discord.Embed(description="⌛ Confirmation timed out. Request Cancelled.", color=discord.Color.red())
+        await author.send(embed=timeout_emb)
+        return False
+
+
+# ------------- Events -------------
 @bot.event
-async def on_thread_delete(thread: discord.Thread):
-    """Cleanup when a thread is deleted"""
-    if thread.id in sticky_messages:
-        del sticky_messages[thread.id]
-    if thread.id in sticky_tasks:
-        sticky_tasks[thread.id].cancel()
-        del sticky_tasks[thread.id]
+async def on_ready():
+    load_data()
+    print(f"✅ Logged in as {bot.user}")
+    # resume all stickies
+    for tid, entry in sticky_data.items():
+        if not entry.get("active", True):
+            continue
+        try:
+            thread = await bot.fetch_channel(int(tid))
+            if not isinstance(thread, discord.Thread):
+                continue
+            emb = make_solution_embed(entry.get("content", "(no text)"), entry.get("marked_by", "Unknown"))
+            view = make_jump_view(thread.guild.id, thread.id, entry.get("original_message_id"))
+            msg = await thread.send(embed=emb, view=view)
+            entry["sticky_message_id"] = msg.id
+            entry["timestamp"] = iso_now()
+            save_data()
+            tasks[tid] = asyncio.create_task(refresh_cycle(tid))
+        except Exception as e:
+            log(f"Failed to resume sticky {tid}: {e}")
 
 
 @bot.event
@@ -53,196 +271,78 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    # Only trigger if the bot is pinged in a reply (inside a thread)
-    if bot.user.mentioned_in(message) and message.reference and isinstance(message.channel, discord.Thread):
-        thread = message.channel
+    content = message.content.strip()
+    ch = message.channel
+
+    # --- Permission-protected commands ---
+    if content in ("-sd", "-console"):
+        if message.author.id != OWNER_ID:
+            emb = make_permission_denied_embed(content, message.author)
+            await message.channel.send(embed=emb)
+            return
+
+    # --- Shutdown (embed) ---
+    if content == "-sd" and message.author.id == OWNER_ID:
+        emb = discord.Embed(description="🛑 Shutting down.", color=discord.Color.red())
+        await message.channel.send(embed=emb)
+        save_data()
+        for t in list(tasks.values()):
+            try:
+                t.cancel()
+            except Exception:
+                pass
+        await bot.close()
+        return
+
+    # --- Console ---
+    if content == "-console" and message.author.id == OWNER_ID:
+        lines = console_logs[-CONSOLE_RETURN_LINES:]
+        desc = "\n".join(lines) if lines else "No internal events yet."
+        emb = discord.Embed(title="Console (Internal Events)", description=desc, color=discord.Color.blurple())
+        await message.author.send(embed=emb)
+        return
+
+    # --- Only threads inside parent ---
+    if not isinstance(ch, discord.Thread) or ch.parent_id != PARENT_CHANNEL_ID:
+        await bot.process_commands(message)
+        return
+
+    # --- Sticky creation ---
+    if content == "-sticky" and message.reference:
         try:
-            replied_msg = await thread.fetch_message(message.reference.message_id)
-            
-            if not replied_msg.content and not replied_msg.embeds:
-                await message.reply("❌ Cannot mark an empty message as solution!", mention_author=False)
+            replied = await ch.fetch_message(message.reference.message_id)
+        except Exception:
+            emb = discord.Embed(description="❌ Could not find the replied message. Make sure your replying to a message while running the command", color=discord.Color.red())
+            await message.reply(embed=emb)
+            return
+
+        tid = str(ch.id)
+        existing = sticky_data.get(tid)
+        if existing and existing.get("active", False):
+            ok = await ask_replace_confirmation(message.author)
+            if not ok:
+                emb = discord.Embed(description="❎ Sticky replacement cancelled.", color=discord.Color.red())
+                await message.reply(embed=emb)
                 return
+            old_id = existing.get("sticky_message_id")
+            if old_id:
+                await delete_msg_if_exists(ch, old_id)
 
-            # Prevent double execution of msgs
-            await asyncio.sleep(0.5)
-
-            # If there's already a sticky message, then ask for a overide
-            if thread.id in sticky_messages:
-                try:
-                    prev_sticky_id = sticky_messages[thread.id]
-                    await thread.fetch_message(prev_sticky_id)  # Confirm the msgs existence
-                    await ask_override_confirmation(message.author, thread, replied_msg)
-                    return
-                except discord.NotFound:
-                    pass  # if there isnt then dont let the user continue and make a new sticky
-
-            await create_sticky_message(thread, replied_msg, message.author)
-            await message.reply("✅ Solution has been marked and pinned to the bottom!", mention_author=False)
-
-        except discord.NotFound:
-            await message.reply("❌ Could not find the message you replied to!", mention_author=False)
-        except discord.Forbidden:
-            await message.reply("❌ I don't have permission to manage messages in this thread!", mention_author=False) # quite self explanatory i think
-        except Exception as e:
-            print(f"Error in on_message: {e}")
-            await message.reply("❌ An error occurred while processing your request.", mention_author=False)
+        created = await create_sticky(ch, replied, message.author.display_name)
+        if created:
+            if tid in tasks:
+                tasks[tid].cancel()
+            tasks[tid] = asyncio.create_task(refresh_cycle(tid))
+            emb = discord.Embed(description="✅ Sticky created and pinned.", color=discord.Color.green())
+            await message.reply(embed=emb)
+        else:
+            emb = discord.Embed(description="❌ Failed to create sticky.", color=discord.Color.red())
+            await message.reply(embed=emb)
 
     await bot.process_commands(message)
 
 
-async def create_sticky_message(thread: discord.Thread, replied_msg: discord.Message, author: discord.Member) -> Optional[discord.Message]:
-    """Creates a new sticky message and starts its manager"""
-    try:
-        # Create the sticky embed
-        embed = create_solution_embed(replied_msg.content, author)
-        
-        # Create jump button
-        view = discord.ui.View()
-        jump_button = discord.ui.Button(label="Jump to Solution", url=replied_msg.jump_url, style=discord.ButtonStyle.link)
-        view.add_item(jump_button)
-
-        sticky = await thread.send(embed=embed, view=view)
-        sticky_messages[thread.id] = sticky.id
-
-        # Cancel existing task if any
-        if thread.id in sticky_tasks:
-            sticky_tasks[thread.id].cancel()
-
-        # Create new task
-        task = bot.loop.create_task(sticky_manager(thread, sticky, replied_msg, author))
-        sticky_tasks[thread.id] = task
-        
-        return sticky
-    except Exception as e:
-        print(f"Error creating sticky message: {e}")
-        return None
-
-
-def create_solution_embed(content: str, author: discord.Member) -> discord.Embed:
-    """Creates the solution embed"""
-    description = content[:4000] if len(content) > 4000 else content  # Discord embed description limit
-    embed = discord.Embed(
-        title="💡 **Solution Message**",
-        description=f"**The solution to this problem is:**\n\n{description}",
-        color=discord.Color.green()
-    )
-    embed.set_footer(text=f"Marked by {author.display_name}")
-    return embed
-
-
-async def sticky_manager(thread: discord.Thread, sticky_msg: discord.Message, replied_msg: discord.Message, author: discord.Member):
-    """Keeps the sticky message at the bottom of the thread."""
-    try:
-        await asyncio.sleep(2)
-        while True:
-            await asyncio.sleep(1)
-            try:
-                last_msg = None
-                async for msg in thread.history(limit=1):
-                    last_msg = msg
-                if not last_msg:
-                    continue
-
-                if last_msg.id != sticky_msg.id:
-                    # Delete old sticky
-                    try:
-                        await sticky_msg.delete()
-                    except discord.NotFound:
-                        pass
-
-                    # Resend sticky with same content
-                    new_msg = await create_sticky_message(thread, replied_msg, author)
-                    if new_msg:
-                        sticky_msg = new_msg
-            except discord.NotFound:
-                # Thread was deleted
-                break
-            except discord.Forbidden:
-                print(f"Lost permissions in thread {thread.name}")
-                break
-            except Exception as e:
-                print(f"Sticky loop error in {thread.name}: {e}")
-                await asyncio.sleep(5)  # Back off on error
-    finally:
-        # Cleanup
-        if thread.id in sticky_tasks:
-            del sticky_tasks[thread.id]
-
-
-async def ask_override_confirmation(user: discord.Member, thread: discord.Thread, new_replied_msg: discord.Message):
-    """DMs the user asking to confirm sticky override."""
-    try:
-        dm = await user.create_dm()
-        embed = discord.Embed(
-            title="⚠️ Override Confirmation",
-            description=(
-                f"You are about to override the current solution in **{thread.name}**.\n\n"
-                "If this is unintentional or incorrect, click **No**.\n"
-                "Otherwise, press **Yes** to confirm."
-            ),
-            color=discord.Color.orange()
-        )
-
-        yes_button = discord.ui.Button(label="Yes", style=discord.ButtonStyle.danger)
-        no_button = discord.ui.Button(label="No", style=discord.ButtonStyle.secondary)
-
-        async def yes_callback(interaction: discord.Interaction):
-            if interaction.user.id != user.id:
-                await interaction.response.send_message("❌ You can't press this button.", ephemeral=True)
-                return
-
-            await interaction.response.send_message("✅ Overriding existing solution...", ephemeral=True)
-
-            # Delete old sticky
-            try:
-                old_sticky_id = sticky_messages.get(thread.id)
-                if old_sticky_id:
-                    old_msg = await thread.fetch_message(old_sticky_id)
-                    await old_msg.delete()
-            except Exception:
-                pass
-
-            await create_sticky_message(thread, new_replied_msg, user)
-            await dm.send("✅ Successfully overridden the existing solution.")
-
-        async def no_callback(interaction: discord.Interaction):
-            if interaction.user.id == user.id:
-                await interaction.response.send_message("❎ Cancelled override.", ephemeral=True)
-
-        yes_button.callback = yes_callback
-        no_button.callback = no_callback
-
-        view = discord.ui.View(timeout=60)  # 60 second timeout
-        view.add_item(yes_button)
-        view.add_item(no_button)
-
-        confirmation_message = await dm.send(embed=embed, view=view)
-
-        # Disable buttons after timeout
-        await asyncio.sleep(60)
-        for item in view.children:
-            item.disabled = True
-        await confirmation_message.edit(view=view)
-
-    except discord.Forbidden:
-        await thread.send(f"{user.mention}, I couldn't DM you for confirmation. Please enable DMs.", delete_after=8)
-
-
-@bot.tree.command(name="sd", description="Shuts down the bot (owner only).")
-async def shutdown(interaction: discord.Interaction):
-    if interaction.user.id not in OWNER_IDS:
-        await interaction.response.send_message("❌ You are not authorized to do this.", ephemeral=True)
-        return
-
-    await interaction.response.send_message("🛑 Shutting down StickyPins bot...", ephemeral=True)
-    print("Bot manually shut down by owner.")
-    
-    # Cancel all sticky tasks
-    for task in sticky_tasks.values():
-        task.cancel()
-    
-    await bot.close()
-
-
-
-bot.run(TOKEN)
+# ------------- Run -------------
+if __name__ == "__main__":
+    load_data()
+    bot.run(TOKEN)

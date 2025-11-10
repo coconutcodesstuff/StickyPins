@@ -5,7 +5,7 @@
 
 This Bot was built to serve the need for a sticky bot at a large scale with it being allocated only to one guild.
 
-It runs 1 main commands, accesible to everyone, and 2 other commands, that are not accesible to everyone and remain for maintainence purposes.
+It runs 1 main commands, accessible to everyone, and 2 other commands, that are not accesible to everyone and remain for maintainence purposes.
 
 ## -sticky
 

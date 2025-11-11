@@ -19,14 +19,14 @@ if not TOKEN:
 
 
 
-PARENT_CHANNEL_ID = 1407193062064787592
-OWNER_ID = 1202369414721450005
+PARENT_CHANNEL_ID = #[Channel Id of the Channel that will contain multiple threads within it]
+OWNER_ID = #[User ID of whoever is running the bot]
 DATA_FILE = "stickydata.json"
 REFRESH_INTERVAL = 8.0
 BACKOFF_INTERVAL = 10.0
-MAX_AGE_DAYS = 30
-LOG_LINES_LIMIT = 200
-CONSOLE_RETURN_LINES = 30
+MAX_AGE_DAYS = 30 #Can Be Adjusted
+LOG_LINES_LIMIT = 200 #Maximum lines allowed for console commands in total i think. i kinda forgot what i set it to
+CONSOLE_RETURN_LINES = 30 #yeah maximum return lines on one page
 
 intents = discord.Intents.default()
 intents.messages = True
@@ -346,3 +346,4 @@ async def on_message(message: discord.Message):
 if __name__ == "__main__":
     load_data()
     bot.run(TOKEN)
+

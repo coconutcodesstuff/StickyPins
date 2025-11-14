@@ -17,6 +17,6 @@ In the case that this happens:
 
 The bot will DM the user and ask for a confirmation about if they want to change the stickied message, with the choice of either reacting to either the Check Mark Reaction, OR the Cross Reaction. If The check mark reaction is pressed, it will replace the set sticky message's text and change it to the new sticky message within the database. After this is done, the code will auto-update the sticky!
 
-##@stickypins and -solution Added
+## @stickypins and -solution Added
 
 This was done as per a request.

@@ -1,13 +1,12 @@
 #Insane amount of changes done, including directory adjustments for it to be compatible with pterodactly based linux vm's
-#Labelling felt kinda useless so i removed it and instead of it, wasted my time on this ------ thing because it looks nice
+#Further Updated it to be able to deactivate cogs as well
 #little bit of chatgpt because it was rlly painful to get the directory working
 #image support with stickies within embed
 #@stickypins, -sticky, and -solution performing the same functions
+#-deactivate to deactivate a particular thread when followed by a thread id within the parent id
 #inbuilt image storage to make sure files are always avalible
 #Last Version So far before release
 # primarybot.py
-
-
 import discord
 from discord.ext import commands
 import asyncio
@@ -22,16 +21,16 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
     raise SystemExit("DISCORD_TOKEN not found in environment (.env)")
 
-PARENT_CHANNEL_ID = 1407193062064787592
-OWNER_ID = 1202369414721450005
-DATA_FILE = "stickydata.json"
-STICKY_MEDIA_DIR = "/home/container/StickyPins/sticky_media"
-REFRESH_INTERVAL = 8.0
-BACKOFF_INTERVAL = 10.0
-MAX_AGE_DAYS = 30
-LOG_LINES_LIMIT = 200
-CONSOLE_RETURN_LINES = 30
-SUPPORTED_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+PARENT_CHANNEL_ID = [Forum ID]
+OWNER_ID = [User ID of the host]
+STICKY_MEDIA_DIR = "/home/container" #Folder Directory of sticky_media, this is where all images from threads are stored
+DATA_FILE = os.path.join(os.path.dirname(STICKY_MEDIA_DIR), "stickydata.json") #Under testing, it has been observed that some linux vm's, particularly pterodactyl based host vm's have a problem where stickydata.json is duplicated, this is done to prevent any mismatch of the files
+REFRESH_INTERVAL = 8.0 #The amount of time taken for each thread to check for new msgs and repost accordingly
+BACKOFF_INTERVAL = 10.0 #The amount of time that is used as an interval when the bot is ratelimited, this temporarily replaces REFRESH_INTERVAL
+MAX_AGE_DAYS = 30 #After a thread is older than n amount of days, it will automatically deactivate sticky reposting
+LOG_LINES_LIMIT = 200 #Amount of lines dilsplayable by -console
+CONSOLE_RETURN_LINES = 30 #Amount of lines displayable on one page of -console (in the case pagination is required)
+SUPPORTED_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"} #All Supported formats for images in solution sticky
 
 intents = discord.Intents.default()
 intents.messages = True
@@ -39,13 +38,27 @@ intents.message_content = True
 intents.guilds = True
 intents.members = True
 
-bot = commands.Bot(command_prefix="-", intents=intents)
+class StickyBot(commands.Bot):
+    async def setup_hook(self):
+        # load your deactivate cog here
+        await self.load_extension("cogs.deactivate")
+
+
+bot = StickyBot(command_prefix="-", intents=intents)
 
 # ------------- Runtime state -------------
-sticky_data = {}   # thread_id(str) -> entry dict
-tasks = {}         # thread_id(str) -> asyncio.Task
-locks = {}         # thread_id(str) -> asyncio.Lock
-console_logs = []   # in-memory internal events (no timestamps/paths)
+sticky_data = {}          # thread_id(str) -> entry dict
+tasks = {}                # thread_id(str) -> asyncio.Task
+locks = {}                # thread_id(str) -> asyncio.Lock
+deactivated_threads = {}  # thread_id(str) -> bool (False = deactivated)
+console_logs = []         # in-memory internal events (no timestamps/paths)
+
+#So satisfying to make them all the comments allign hehe
+# Expose core runtime dictionaries on the bot instance so cogs can access them via self.bot without importing primarybot as a module.
+bot.sticky_data = sticky_data
+bot.tasks = tasks
+bot.deactivated_threads = deactivated_threads
+
 
 # ------------- Helpers -------------
 def log(line: str):
@@ -53,7 +66,7 @@ def log(line: str):
     console_logs.append(clean)
     if len(console_logs) > LOG_LINES_LIMIT:
         del console_logs[0 : len(console_logs) - LOG_LINES_LIMIT]
-    # still print for operator convenience, no timestamps
+        # a
     print(clean)
 
 def load_data():
@@ -123,10 +136,10 @@ def make_permission_denied_embed(command_name: str, user: discord.User):
 
 def make_solution_embed(content: str, asked_by_name: str):
     desc = content if content else "(no text)"
-    emb = discord.Embed(title="💡 Solution To This Question", description=desc, color=discord.Color.gold())
+    emb = discord.Embed(title="💡 Solution To This Question!", description=desc, color=discord.Color.gold())
     emb.set_footer(text=f"Asked by {asked_by_name}")
     return emb
-
+#lwk might wanna change these emoji's
 def make_jump_view(guild_id: int, channel_id: int, message_id: int):
     view = discord.ui.View()
     url = f"https://discord.com/channels/{guild_id}/{channel_id}/{message_id}"
@@ -198,10 +211,26 @@ async def save_attachments_locally(thread_id: str, original_msg: discord.Message
     return out
 
 def build_local_attachment_paths(thread_id: str, rel_paths):
-    """Return absolute file paths from stored relative ones (under STICKY_MEDIA_DIR)."""
+    """Return absolute file paths from stored relative ones (under STICKY_MEDIA_DIR).
+    This function will attempt the primary STICKY_MEDIA_DIR and also a likely alternative
+    '/home/container/sticky_media' (useful for host environments)."""
     res = []
+    # compute alternative media dir: one level up from STICKY_MEDIA_DIR parent + "sticky_media"
+    # e.g. if STICKY_MEDIA_DIR = /home/container/StickyPins/sticky_media -> alt = /home/container/sticky_media
+    alt_media_dir = os.path.normpath(os.path.join(os.path.dirname(STICKY_MEDIA_DIR), "..", "sticky_media"))
+
     for rel in rel_paths:
-        res.append(os.path.join(STICKY_MEDIA_DIR, rel))
+        # rel is stored like "<thread_id>/<filename>"
+        primary_path = os.path.join(STICKY_MEDIA_DIR, rel)
+        if os.path.exists(primary_path):
+            res.append(primary_path)
+            continue
+        alt_path = os.path.join(alt_media_dir, rel)
+        if os.path.exists(alt_path):
+            res.append(alt_path)
+            continue
+        # if neither exists, still append primary (caller will log/open and handle failure)
+        res.append(primary_path)
     return res
 
 # ------------- Core operations -------------
@@ -266,9 +295,11 @@ async def create_sticky(thread: discord.Thread, original_msg: discord.Message, m
         except Exception:
             pass
 
+    tid_str = str(thread.id)
+
     # update DB (store relative attachment paths list)
-    sticky_data[str(thread.id)] = {
-        "thread_id": str(thread.id),
+    sticky_data[tid_str] = {
+        "thread_id": tid_str,
         "sticky_message_id": sent.id,
         "original_message_id": original_msg.id,
         "content": original_msg.content or "",
@@ -277,6 +308,8 @@ async def create_sticky(thread: discord.Thread, original_msg: discord.Message, m
         "active": True,
         "attachments": saved or []  # list of relative paths under sticky_media/<thread_id>/...
     }
+    # ensure this thread is marked active in the flag dict as well
+    deactivated_threads[tid_str] = True
     save_data()
     log(f"Created sticky in thread {thread.name} ({thread.id}) by {marker_name}")
     return sent
@@ -294,6 +327,12 @@ async def refresh_cycle(thread_id_str: str):
     lock = locks.setdefault(thread_id_str, asyncio.Lock())
     interval = REFRESH_INTERVAL
     while True:
+        # check global deactivation flag first
+        entry = sticky_data.get(thread_id_str)
+        if not entry or entry.get("active") is False:
+            log(f"Stopping refresh task for thread {thread_id_str} (inactive)")
+            break
+
         entry = sticky_data.get(thread_id_str)
         if not entry or not entry.get("active", False):
             log(f"Stopping refresh task for thread {thread_id_str} (inactive/missing)")
@@ -408,7 +447,7 @@ async def ask_replace_confirmation(author: discord.Member):
             await author.send(embed=cancel_emb)
             return False
     except asyncio.TimeoutError:
-        timeout_emb = discord.Embed(description="⌛ Confirmation timed out. Sticky replacement cancelled.", color=discord.Color.red())
+        timeout_emb = discord.Embed(description="⌛ Confirmation timed out. Your Sticky Replace Request has been Cancellled. Try Replacing the sticky again and react to the confirmation message within 10 seconds!.", color=discord.Color.red())
         await author.send(embed=timeout_emb)
         return False
 
@@ -511,7 +550,7 @@ async def sticky_cmd(ctx):
     # ensure allowed channel (must be in a thread under parent)
     ch = ctx.channel
     if not isinstance(ch, discord.Thread) or ch.parent_id != PARENT_CHANNEL_ID:
-        emb = discord.Embed(description="❌ This command can only be used inside a thread under the designated parent channel.", color=discord.Color.red())
+        emb = discord.Embed(description="❌ This command can only be used inside a thread within the Help channel!", color=discord.Color.red())
         return await ctx.send(embed=emb)
     # must be used as a reply
     if not ctx.message.reference:
@@ -520,7 +559,7 @@ async def sticky_cmd(ctx):
     try:
         replied = await ch.fetch_message(ctx.message.reference.message_id)
     except Exception:
-        emb = discord.Embed(description="❌ Could not fetch the replied message.", color=discord.Color.red())
+        emb = discord.Embed(description="❌ Could not fetch the replied message. Make sure its not deleted!", color=discord.Color.red())
         return await ctx.send(embed=emb)
 
     # ---- pre-check attachments ----
@@ -551,7 +590,7 @@ async def sticky_cmd(ctx):
         emb = discord.Embed(description="✅ Sticky created and pinned.", color=discord.Color.green())
         return await ctx.send(embed=emb)
     else:
-        emb = discord.Embed(description="❌ Failed to create sticky. Check permissions or attachments.", color=discord.Color.red())
+        emb = discord.Embed(description="❌ Failed to create sticky. Check if your image is not supported by discord, Otherwise, permissions may be denied.", color=discord.Color.red())
         return await ctx.send(embed=emb)
 
 @bot.event
@@ -576,7 +615,7 @@ async def on_message(message: discord.Message):
 
     # Owner shutdown
     if content == "-sd" and message.author.id == OWNER_ID:
-        emb = discord.Embed(description="🛑 Shutting down (owner request).", color=discord.Color.red())
+        emb = discord.Embed(description="✌ Shutting down. cya!", color=discord.Color.red())
         try:
             await message.channel.send(embed=emb)
         except Exception:
@@ -651,13 +690,13 @@ async def on_message(message: discord.Message):
                 emb = discord.Embed(description="✅ Sticky created and pinned.", color=discord.Color.green())
                 await message.reply(embed=emb, mention_author=False)
             else:
-                emb = discord.Embed(description="❌ Failed to create sticky. Check permissions or attachments.", color=discord.Color.red())
+                emb = discord.Embed(description="❌ Failed to create sticky. Check if your image is not supported by discord, Otherwise, permissions may be denied.", color=discord.Color.red())
                 await message.reply(embed=emb, mention_author=False)
             return
         else:
             # ping without reply -> instruct user to reply while pinging
             emb = discord.Embed(
-                title="Reply to a message when pinging me",
+                title="Reply to the sticky message when pinging me!",
                 description="You must reply to the message you want to mark as a solution when pinging the bot.",
                 color=discord.Color.red()
             )
@@ -708,13 +747,20 @@ async def on_message(message: discord.Message):
             emb = discord.Embed(description="✅ Sticky created and pinned.", color=discord.Color.green())
             await message.reply(embed=emb)
         else:
-            emb = discord.Embed(description="❌ Failed to create sticky. Check permissions or attachments.", color=discord.Color.red())
+            emb = discord.Embed(description="❌ Failed to create sticky. Check if your image is not supported by discord, Otherwise, permissions may be denied.", color=discord.Color.red())
             await message.reply(embed=emb)
         return
 
 # ------------- Run -------------
 if __name__ == "__main__":
     load_data()
-    # ensure media dir exists
+    # ensure media dir exists (primary)
     os.makedirs(STICKY_MEDIA_DIR, exist_ok=True)
+    # ensure likely alternate media dir exists too (helps host environment /home/container/sticky_media)
+    alt_media_dir = os.path.normpath(os.path.join(os.path.dirname(STICKY_MEDIA_DIR), "..", "sticky_media"))
+    try:
+        os.makedirs(alt_media_dir, exist_ok=True)
+    except Exception:
+        # non-fatal; just continue
+        pass
     bot.run(TOKEN)

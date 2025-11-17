@@ -1,7 +1,7 @@
 # StickyPins
 
 
-# Final Version as of November 14th
+# Final Version as of November 17th [UPD]
 
 This Bot was built to serve the need for a sticky bot at a large scale with it being allocated only to one guild.
 
@@ -20,3 +20,7 @@ The bot will DM the user and ask for a confirmation about if they want to change
 ## @stickypins and -solution Added
 
 This was done as per a request.
+
+## -deactivate Added
+
+This was done to make sure that threads can be deactivated incase it is ever required

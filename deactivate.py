@@ -3,8 +3,8 @@ from discord.ext import commands
 import json
 import os
 
-OWNER_ID = 1202369414721450005
-ALLOWED_ROLE_ID = None  # Fill in later
+OWNER_ID = #Use the same one as the one in primarybot.py
+ALLOWED_ROLE_ID = None  # Will be decided soon
 
 # Hardcoded path to the canonical stickydata.json used on the host
 STICKY_JSON_PATH = "/home/container/StickyPins/stickydata.json"
@@ -102,3 +102,5 @@ class StickyDeactivator(commands.Cog):
 
 async def setup(bot):
     await bot.add_cog(StickyDeactivator(bot))
+
+#i didnt make all the comments in this hehe

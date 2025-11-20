@@ -40,9 +40,10 @@ intents.members = True
 
 class StickyBot(commands.Bot):
     async def setup_hook(self):
-        # load your deactivate cog here
+        # load your cogs here
         await self.load_extension("cogs.deactivate")
-
+        await self.load_extension("cog.stats")
+        await self.load_extension("cog.sigs")
 
 bot = StickyBot(command_prefix="-", intents=intents)
 
@@ -764,3 +765,4 @@ if __name__ == "__main__":
         # non-fatal; just continue
         pass
     bot.run(TOKEN)
+

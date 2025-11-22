@@ -1,7 +1,7 @@
 # StickyPins
 
 
-# Final Version as of November 17th [UPD]
+# Final Version as of November 22nd 2025
 
 This Bot was built to serve the need for a sticky bot at a large scale with it being allocated only to one guild.
 
@@ -19,8 +19,22 @@ The bot will DM the user and ask for a confirmation about if they want to change
 
 ## @stickypins and -solution Added
 
-This was done as per a request.
+This was done as per a request. Both Serve the same purpose as -sticky
 
 ## -deactivate Added
 
 This was done to make sure that threads can be deactivated incase it is ever required
+
+# All future Updates Below!
+
+## [UPD]22 November 2025 -> -stats and -sigs!
+
+### -stats
+
+This is used to view stats about the bot, such as uptime, dev, info about finding bugs and vulnerabilities, etc! Will be actively further developed as per requirements!
+
+### -sigs
+
+Used to give members particular roles depending on if there team is registered in a set of signature vex events. Each signature role has its own role with the exception of Kalahari Classic (Well its kind of misleading, but Kalahari Classic has both V5 and IQ Events, so no matter which one of those events you are particiapating in, it will set you to only the Kalahari Classic Role rather then independent roles for each event(V5 And IQ). holy yap....)
+
+This uses the /events/{id}/teams, from the Robot Events API End point to retrive all teams participating in the {ID} Event(The ID is hardcoded as its not a var). Whenever a team is inputted, it retrieves the teams in all those events and checks if the inputted team # is in any of the events, if it is, the respective role is given!

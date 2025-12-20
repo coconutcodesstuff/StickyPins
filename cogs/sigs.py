@@ -10,23 +10,23 @@ API_KEY = os.getenv("RE_API_KEY")
 EVENT_MAP = {
     "SHOW ME GATEWAY": {
         "event_ids": [60069],
-        "role_id": 1441052205854490694
+        "role_id": 1440753757565620305
     },
     "BIXBY'S FROSTBYTE FRENZY": {
         "event_ids": [60081],
-        "role_id": 1441052419097235597
+        "role_id": 1440753999379697747
     },
     "SCORE SHOWDOWN": {
-        "event_ids": [59912],
-        "role_id": 1441052357235310652
+        "event_ids": [59912, 55565],
+        "role_id": 1440754038076608643
     },
     "FUN IN THE SUN": {
         "event_ids": [59968],
-        "role_id": 1441052713596227746
+        "role_id": 1440754057940566027
     },
     "KALAHARI CLASSIC": {
         "event_ids": [60025, 60166],
-        "role_id": 1441052795129171999
+        "role_id": 1440754084889231614
     },
 }
 
@@ -56,17 +56,13 @@ class TeamNumberModal(discord.ui.Modal, title="Submit Team Number"):
 
 
 class TeamNumberView(discord.ui.View):
-    def __init__(self, cog, author: discord.Member, *, timeout: float = 60.0):
+    def __init__(self, cog, author: discord.Member, *, timeout: float = None):
         super().__init__(timeout=timeout)
         self.cog = cog
         self.author = author
 
     @discord.ui.button(label="Submit Team Number", style=discord.ButtonStyle.primary)
     async def submit_team(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.author.id:
-            await interaction.response.send_message("This button is linked to someone else's request. Please do not click it!", ephemeral=True)
-            return
-
         if self.cog.is_rate_limited():
             embed = self.cog.make_high_traffic_embed()
             await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -159,7 +155,7 @@ class Sigs(commands.Cog):
 
     @commands.command(name="sigs")
     async def sigs(self, ctx):
-        if ctx.channel.id != 1407193062064787588:
+        if ctx.channel.id != 1338692373042954260:
             await ctx.send("This command is not allowed to be sent here.")
             return
 
@@ -173,7 +169,8 @@ class Sigs(commands.Cog):
                 "• Bixby's FrostByte Frenzy\n"
                 "• SCORE Showdown\n"
                 "• Fun in the Sun\n"
-                "• Kalahari Classic\n\n"
+                "• Kalahari Classic\n"
+                "• Worlds 2026(Coming Soon!)"
                 "_You have 60 seconds after clicking the button to submit._"
             ),
             color=discord.Color.blurple()
@@ -181,6 +178,40 @@ class Sigs(commands.Cog):
 
         view = TeamNumberView(self, ctx.author)
         await ctx.send(embed=embed, view=view)
+
+        # Embed and button for removing pre-existing event roles
+        remove_embed = discord.Embed(
+            title="Remove Your Pre-Existing Roles",
+            description=(
+                "Use the button below to remove any event roles you no longer want.\n\n"
+                "Clicking it will remove all tracked event roles from you if you have them."
+            ),
+            color=discord.Color.red()
+        )
+
+        class RemoveRolesView(discord.ui.View):
+            def __init__(self, *, timeout: float = None):
+                super().__init__(timeout=timeout)
+
+            @discord.ui.button(label="Remove all event roles", style=discord.ButtonStyle.danger)
+            async def remove_all(self, interaction: discord.Interaction, button: discord.ui.Button):
+                guild = interaction.guild
+                member = interaction.user
+                event_role_ids = {info["role_id"] for info in EVENT_MAP.values()}
+                roles_to_remove = [r for r in member.roles if r.id in event_role_ids]
+                if not roles_to_remove:
+                    await interaction.response.send_message("You do not currently have any event roles to remove.", ephemeral=True)
+                    return
+                try:
+                    await member.remove_roles(*roles_to_remove)
+                except discord.Forbidden:
+                    await interaction.response.send_message("❌ I do not have permission to remove roles.", ephemeral=True)
+                    return
+                removed_names = ", ".join(role.name for role in roles_to_remove)
+                await interaction.response.send_message(f"✅ Removed roles: **{removed_names}**", ephemeral=True)
+
+        remove_view = RemoveRolesView(timeout=None)
+        await ctx.send(embed=remove_embed, view=remove_view)
 
 
 async def setup(bot):

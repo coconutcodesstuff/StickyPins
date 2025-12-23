@@ -44,6 +44,7 @@ class StickyBot(commands.Bot):
         await self.load_extension("cogs.deactivate")
         await self.load_extension("cog.stats")
         await self.load_extension("cog.sigs")
+        await self.load_extension("cogs.admin") #I swear its not what the name looks like 😭
 
 bot = StickyBot(command_prefix="-", intents=intents)
 
@@ -765,4 +766,5 @@ if __name__ == "__main__":
         # non-fatal; just continue
         pass
     bot.run(TOKEN)
+
 

@@ -27,7 +27,7 @@ This was done to make sure that threads can be deactivated incase it is ever req
 
 # All future Updates Below!
 
-## [UPD]22 November 2025 -> -stats and -sigs!
+## [UPD]22nd November 2025 -> -stats and -sigs!
 
 ### -stats
 
@@ -38,6 +38,8 @@ This is used to view stats about the bot, such as uptime, dev, info about findin
 Used to give members particular roles depending on if there team is registered in a set of signature vex events. Each signature role has its own role with the exception of Kalahari Classic (Well its kind of misleading, but Kalahari Classic has both V5 and IQ Events, so no matter which one of those events you are particiapating in, it will set you to only the Kalahari Classic Role rather then independent roles for each event(V5 And IQ). holy yap....)
 
 This uses the /events/{id}/teams, from the Robot Events API End point to retrieve all teams participating in the {ID} Event(The ID is hardcoded as its not a value that can change). Whenever a team is inputted, it retrieves the teams in all those events and checks if the inputted team # is in any of the events, if it is, the respective role is given! Extra Sumbissions will update your roles accordingly, which includes roles being removed, and given as per the new team #. If the same team # is inputted, nothing changes!(Future coconut here, this failed miserably....)
+
+## [UPD]22nd December 2025 -> Updated event ID's for -sigs and -sigsregen cmd
 
 ### -sigsregen
 

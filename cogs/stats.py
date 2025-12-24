@@ -16,7 +16,7 @@ class Stats(commands.Cog):
         # --- Uptime ---
         now = datetime.now(timezone.utc)
         uptime_delta = now - getattr(self.bot, "start_time", now)
-        uptime_str = str(uptime_delta).split(".")[0]
+        uptime_str = str(uptime_delta).split('.', maxsplit=1)[0]
 
         # --- Total stickies ever made ---
         total_stickies = 0

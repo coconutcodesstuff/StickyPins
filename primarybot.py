@@ -6,7 +6,10 @@
 #-deactivate to deactivate a particular thread when followed by a thread id within the parent id
 #inbuilt image storage to make sure files are always avalible
 #Last Version So far before release
+#Massive changes put in place regarding sticky saving, file routes, scrapping of deactivate and introducing eradicate(a better version of deactivate)
+#Wasted time on comments asw dw, also removed some unnecessary ones, there too hard to look at
 # primarybot.py
+
 import discord
 from discord.ext import commands
 import asyncio
@@ -21,45 +24,67 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
     raise SystemExit("DISCORD_TOKEN not found in environment (.env)")
 
-PARENT_CHANNEL_ID = [Forum ID]
-OWNER_ID = [User ID of the host]
-STICKY_MEDIA_DIR = "/home/container" #Folder Directory of sticky_media, this is where all images from threads are stored
-DATA_FILE = os.path.join(os.path.dirname(STICKY_MEDIA_DIR), "stickydata.json") #Under testing, it has been observed that some linux vm's, particularly pterodactyl based host vm's have a problem where stickydata.json is duplicated, this is done to prevent any mismatch of the files
-REFRESH_INTERVAL = 8.0 #The amount of time taken for each thread to check for new msgs and repost accordingly
-BACKOFF_INTERVAL = 10.0 #The amount of time that is used as an interval when the bot is ratelimited, this temporarily replaces REFRESH_INTERVAL
-MAX_AGE_DAYS = 30 #After a thread is older than n amount of days, it will automatically deactivate sticky reposting
-LOG_LINES_LIMIT = 200 #Amount of lines dilsplayable by -console
-CONSOLE_RETURN_LINES = 30 #Amount of lines displayable on one page of -console (in the case pagination is required)
-SUPPORTED_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"} #All Supported formats for images in solution sticky
-
+# ---------- Intents ----------
 intents = discord.Intents.default()
 intents.messages = True
 intents.message_content = True
 intents.guilds = True
 intents.members = True
 
+# ---------- Bot class ----------
 class StickyBot(commands.Bot):
     async def setup_hook(self):
-        # load your cogs here
-        await self.load_extension("cogs.deactivate")
-        await self.load_extension("cog.stats")
-        await self.load_extension("cog.sigs")
-        await self.load_extension("cogs.admin") #I swear its not what the name looks like 😭
+        await self.load_extension("cogs.stats")
+        await self.load_extension("cogs.admin")
+        await self.load_extension("cogs.sigs")
+        await self.load_extension("cogs.eradicate")
+        await self.load_extension("cogs.sticky_diagnostics")
 
+        # sync application commands (slash commands)
+        try:
+            await self.tree.sync()
+        except Exception as e:
+            print(f"Failed to sync app commands: {e}")
+
+
+# ---------- Bot instance ----------
 bot = StickyBot(command_prefix="-", intents=intents)
 
-# ------------- Runtime state -------------
-sticky_data = {}          # thread_id(str) -> entry dict
-tasks = {}                # thread_id(str) -> asyncio.Task
-locks = {}                # thread_id(str) -> asyncio.Lock
-deactivated_threads = {}  # thread_id(str) -> bool (False = deactivated)
-console_logs = []         # in-memory internal events (no timestamps/paths)
+# ---------- File paths and config ----------
+STICKY_MEDIA_DIR = "/home/container/StickyPins/sticky_media"
+DATA_FILE = "/home/container/StickyPins/stickydata.json"
 
-#So satisfying to make them all the comments allign hehe
-# Expose core runtime dictionaries on the bot instance so cogs can access them via self.bot without importing primarybot as a module.
+# Expose paths on bot instance for cog access
+bot.STICKY_MEDIA_DIR = STICKY_MEDIA_DIR
+bot.STICKY_DATA_FILE = DATA_FILE
+
+# ---------- Other constants ----------
+PARENT_CHANNEL_ID = 1319405822601855048
+OWNER_ID = 1202369414721450005
+REFRESH_INTERVAL = 8.0
+BACKOFF_INTERVAL = 15.0
+MAX_AGE_DAYS = 7
+LOG_LINES_LIMIT = 200
+CONSOLE_RETURN_LINES = 30
+SUPPORTED_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+
+
+
+# ------------- Runtime state -------------
+sticky_data = {}        # thread_id(str) -> entry dict
+tasks = {}              # thread_id(str) -> asyncio.Task
+locks = {}              # thread_id(str) -> asyncio.Lock
+deactivated_threads = {}  # thread_id(str) -> bool (False = deactivated)
+console_logs = []       # in-memory internal events (no timestamps/paths)
+
+# Expose core runtime dictionaries on the bot instance so cogs can access
+# them via self.bot without importing primarybot as a module.
 bot.sticky_data = sticky_data
 bot.tasks = tasks
 bot.deactivated_threads = deactivated_threads
+
+# Expose config/state helpers needed by cogs
+bot.start_time = datetime.now(timezone.utc)
 
 
 # ------------- Helpers -------------
@@ -68,7 +93,7 @@ def log(line: str):
     console_logs.append(clean)
     if len(console_logs) > LOG_LINES_LIMIT:
         del console_logs[0 : len(console_logs) - LOG_LINES_LIMIT]
-        # a
+    # still print for operator convenience, no timestamps
     print(clean)
 
 def load_data():
@@ -141,7 +166,7 @@ def make_solution_embed(content: str, asked_by_name: str):
     emb = discord.Embed(title="💡 Solution To This Question!", description=desc, color=discord.Color.gold())
     emb.set_footer(text=f"Asked by {asked_by_name}")
     return emb
-#lwk might wanna change these emoji's
+
 def make_jump_view(guild_id: int, channel_id: int, message_id: int):
     view = discord.ui.View()
     url = f"https://discord.com/channels/{guild_id}/{channel_id}/{message_id}"
@@ -215,10 +240,11 @@ async def save_attachments_locally(thread_id: str, original_msg: discord.Message
 def build_local_attachment_paths(thread_id: str, rel_paths):
     """Return absolute file paths from stored relative ones (under STICKY_MEDIA_DIR).
     This function will attempt the primary STICKY_MEDIA_DIR and also a likely alternative
-    '/home/container/sticky_media' (useful for host environments)."""
+    '/home/container/sticky_media' (because my vm always manages to mess this up smhow*duplicating routes))."""
     res = []
     # compute alternative media dir: one level up from STICKY_MEDIA_DIR parent + "sticky_media"
     # e.g. if STICKY_MEDIA_DIR = /home/container/StickyPins/sticky_media -> alt = /home/container/sticky_media
+    #same as the issue that i explained above in the big comment
     alt_media_dir = os.path.normpath(os.path.join(os.path.dirname(STICKY_MEDIA_DIR), "..", "sticky_media"))
 
     for rel in rel_paths:
@@ -615,22 +641,26 @@ async def on_message(message: discord.Message):
             pass
         return
 
-    # Owner shutdown
+        # Owner shutdown
     if content == "-sd" and message.author.id == OWNER_ID:
         emb = discord.Embed(description="✌ Shutting down. cya!", color=discord.Color.red())
         try:
             await message.channel.send(embed=emb)
         except Exception:
             pass
+
         log("🟥 Manual shutdown initiated by owner.")
+
         for t in list(tasks.values()):
             try:
                 t.cancel()
             except Exception:
                 pass
-        save_data()
+
+
         await bot.close()
         return
+
 
     # Owner console
     if content == "-console" and message.author.id == OWNER_ID:
@@ -766,5 +796,6 @@ if __name__ == "__main__":
         # non-fatal; just continue
         pass
     bot.run(TOKEN)
+
 
 

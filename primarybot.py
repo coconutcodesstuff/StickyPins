@@ -1,20 +1,11 @@
-#Insane amount of changes done, including directory adjustments for it to be compatible with pterodactly based linux vm's
-#Further Updated it to be able to deactivate cogs as well
-#little bit of chatgpt because it was rlly painful to get the directory working
-#image support with stickies within embed
-#@stickypins, -sticky, and -solution performing the same functions
-#-deactivate to deactivate a particular thread when followed by a thread id within the parent id
-#inbuilt image storage to make sure files are always avalible
-#Last Version So far before release
-#Massive changes put in place regarding sticky saving, file routes, scrapping of deactivate and introducing eradicate(a better version of deactivate)
-#Wasted time on comments asw dw, also removed some unnecessary ones, there too hard to look at
+## lmfao deleted all the comments above this xd
 # primarybot.py
-
 import discord
 from discord.ext import commands
 import asyncio
 import json
 import os
+import time
 from dotenv import load_dotenv
 from datetime import datetime, timezone, timedelta
 
@@ -36,9 +27,10 @@ class StickyBot(commands.Bot):
     async def setup_hook(self):
         await self.load_extension("cogs.stats")
         await self.load_extension("cogs.admin")
-        await self.load_extension("cogs.sigs")
         await self.load_extension("cogs.eradicate")
+        await self.load_extension("cogs.combinedroles")
         await self.load_extension("cogs.sticky_diagnostics")
+        await self.load_extension("cogs.channel_sticky")
 
         # sync application commands (slash commands)
         try:
@@ -51,15 +43,17 @@ class StickyBot(commands.Bot):
 bot = StickyBot(command_prefix="-", intents=intents)
 
 # ---------- File paths and config ----------
-STICKY_MEDIA_DIR = "/home/container/StickyPins/sticky_media"
-DATA_FILE = "/home/container/StickyPins/stickydata.json"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+STICKY_MEDIA_DIR = os.path.join(BASE_DIR, "sticky_media")
+DATA_FILE = os.path.join(BASE_DIR, "stickydata.json")
 
 # Expose paths on bot instance for cog access
 bot.STICKY_MEDIA_DIR = STICKY_MEDIA_DIR
 bot.STICKY_DATA_FILE = DATA_FILE
 
 # ---------- Other constants ----------
-PARENT_CHANNEL_ID = 1319405822601855048
+PARENT_CHANNEL_ID = 1407193062064787592
 OWNER_ID = 1202369414721450005
 REFRESH_INTERVAL = 8.0
 BACKOFF_INTERVAL = 15.0
@@ -69,6 +63,23 @@ CONSOLE_RETURN_LINES = 30
 SUPPORTED_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 
 
+# ------------- EWMA Helper -------------
+
+class EWMA:
+    """
+    Exponentially Weighted Moving Average.
+    Used to estimate thread activity.
+    """
+    __slots__ = ("alpha", "value")
+
+    def __init__(self, alpha: float, initial: float = 0.0):
+        self.alpha = alpha
+        self.value = initial
+
+    def update(self, sample: float) -> float:
+        self.value = self.alpha * sample + (1.0 - self.alpha) * self.value
+        return self.value
+
 
 # ------------- Runtime state -------------
 sticky_data = {}        # thread_id(str) -> entry dict
@@ -76,12 +87,16 @@ tasks = {}              # thread_id(str) -> asyncio.Task
 locks = {}              # thread_id(str) -> asyncio.Lock
 deactivated_threads = {}  # thread_id(str) -> bool (False = deactivated)
 console_logs = []       # in-memory internal events (no timestamps/paths)
+activity_ewma = {}      # thread_id(str) -> EWMA
+last_activity = {}      # thread_id(str) -> monotonic timestamp
 
 # Expose core runtime dictionaries on the bot instance so cogs can access
 # them via self.bot without importing primarybot as a module.
 bot.sticky_data = sticky_data
 bot.tasks = tasks
 bot.deactivated_threads = deactivated_threads
+bot.activity_ewma = activity_ewma
+bot.last_activity = last_activity
 
 # Expose config/state helpers needed by cogs
 bot.start_time = datetime.now(timezone.utc)
@@ -161,10 +176,10 @@ def make_permission_denied_embed(command_name: str, user: discord.User):
     emb.set_footer(text=f"for command [{command_name}] • requested by {user.name}")
     return emb
 
-def make_solution_embed(content: str, asked_by_name: str):
+def make_solution_embed(content: str, asked_by_name: str, solution_by_name: str = None):
     desc = content if content else "(no text)"
     emb = discord.Embed(title="💡 Solution To This Question!", description=desc, color=discord.Color.gold())
-    emb.set_footer(text=f"Asked by {asked_by_name}")
+    emb.set_footer(text=f"Solution Stickied by {asked_by_name}")
     return emb
 
 def make_jump_view(guild_id: int, channel_id: int, message_id: int):
@@ -240,11 +255,10 @@ async def save_attachments_locally(thread_id: str, original_msg: discord.Message
 def build_local_attachment_paths(thread_id: str, rel_paths):
     """Return absolute file paths from stored relative ones (under STICKY_MEDIA_DIR).
     This function will attempt the primary STICKY_MEDIA_DIR and also a likely alternative
-    '/home/container/sticky_media' (because my vm always manages to mess this up smhow*duplicating routes))."""
+    '/home/container/sticky_media' (useful for host environments)."""
     res = []
     # compute alternative media dir: one level up from STICKY_MEDIA_DIR parent + "sticky_media"
     # e.g. if STICKY_MEDIA_DIR = /home/container/StickyPins/sticky_media -> alt = /home/container/sticky_media
-    #same as the issue that i explained above in the big comment
     alt_media_dir = os.path.normpath(os.path.join(os.path.dirname(STICKY_MEDIA_DIR), "..", "sticky_media"))
 
     for rel in rel_paths:
@@ -261,6 +275,35 @@ def build_local_attachment_paths(thread_id: str, rel_paths):
         res.append(primary_path)
     return res
 
+# ------------- Sticky validation helper -------------
+async def validate_existing_sticky(channel: discord.abc.Messageable, existing_entry: dict, thread_id: str):
+    """
+    Validates if an existing sticky entry is actually still valid.
+    Returns True if replacement confirmation is needed, False otherwise.
+    """
+    log(f"Validating existing sticky for thread {thread_id}: {existing_entry}")
+    if not existing_entry or not existing_entry.get("active", False):
+        return False
+    
+    sticky_msg_id = existing_entry.get("sticky_message_id")
+    if not sticky_msg_id:
+        # No message ID means invalid entry
+        return False
+    
+    try:
+        # Try to fetch the existing sticky message
+        await channel.fetch_message(sticky_msg_id)
+        # If we get here, the message exists - need confirmation
+        return True
+    except discord.NotFound:
+        # Sticky message was deleted - no confirmation needed
+        log(f"Existing sticky message {sticky_msg_id} not found in thread {thread_id}; proceeding without confirmation")
+        return False
+    except Exception as e:
+        # Other error - log but proceed with confirmation to be safe
+        log(f"Error checking existing sticky in thread {thread_id}: {e}")
+        return True
+
 # ------------- Core operations -------------
 async def create_sticky(thread: discord.Thread, original_msg: discord.Message, marker_name: str, pin_first_time=True):
     """
@@ -275,7 +318,7 @@ async def create_sticky(thread: discord.Thread, original_msg: discord.Message, m
             # Unexpected error saving attachments; return failure
             emb = discord.Embed(
                 title="Error saving attachments",
-                description="There was an error saving one or more attachments. Sticky was not created.",
+                description="There was an error saving one or more attachments, Hence the Sticky was not created.",
                 color=discord.Color.red()
             )
             try:
@@ -320,15 +363,22 @@ async def create_sticky(thread: discord.Thread, original_msg: discord.Message, m
     if pin_first_time:
         try:
             await sent.pin()
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"Failed to pin sticky in thread {thread.id}: {e}")
+
+    # Send a second message for refreshing (to avoid deleting the pinned one)
+    try:
+        refresh_msg = await thread.send(embed=emb, files=files, view=make_jump_view(thread.guild.id, thread.id, original_msg.id))
+    except Exception as e:
+        log(f"Failed to send refresh sticky in thread {thread.id}: {e}")
+        refresh_msg = sent  # fallback to pinned one
 
     tid_str = str(thread.id)
 
     # update DB (store relative attachment paths list)
     sticky_data[tid_str] = {
         "thread_id": tid_str,
-        "sticky_message_id": sent.id,
+        "sticky_message_id": refresh_msg.id,  # Use the refresh message for cycling
         "original_message_id": original_msg.id,
         "content": original_msg.content or "",
         "marked_by": marker_name,
@@ -359,11 +409,17 @@ async def refresh_cycle(thread_id_str: str):
         entry = sticky_data.get(thread_id_str)
         if not entry or entry.get("active") is False:
             log(f"Stopping refresh task for thread {thread_id_str} (inactive)")
+            # Clean up EWMA on deactivation
+            activity_ewma.pop(thread_id_str, None)
+            last_activity.pop(thread_id_str, None)
             break
 
         entry = sticky_data.get(thread_id_str)
         if not entry or not entry.get("active", False):
             log(f"Stopping refresh task for thread {thread_id_str} (inactive/missing)")
+            # Clean up EWMA on deactivation
+            activity_ewma.pop(thread_id_str, None)
+            last_activity.pop(thread_id_str, None)
             break
 
         try:
@@ -372,11 +428,17 @@ async def refresh_cycle(thread_id_str: str):
                 log(f"Thread {thread_id_str} not a thread; deactivating")
                 entry["active"] = False
                 save_data()
+                # Clean up EWMA on deactivation
+                activity_ewma.pop(thread_id_str, None)
+                last_activity.pop(thread_id_str, None)
                 break
         except Exception:
             log(f"Could not fetch thread {thread_id_str}; deactivating")
             entry["active"] = False
             save_data()
+            # Clean up EWMA on deactivation
+            activity_ewma.pop(thread_id_str, None)
+            last_activity.pop(thread_id_str, None)
             break
 
         async with lock:
@@ -387,7 +449,23 @@ async def refresh_cycle(thread_id_str: str):
                     break
 
                 sticky_msg_id = entry.get("sticky_message_id")
-                if last_msg is None or last_msg.id == sticky_msg_id:
+                if last_msg is None or last_msg.id == sticky_msg_id or (last_msg and last_msg.author.bot):
+                    # decay EWMA once per cycle
+                    ewma = activity_ewma.get(thread_id_str)
+                    if ewma:
+                        ewma.update(0.0)
+
+                    # Dynamic interval based on activity
+                    score = ewma.value if ewma else 0.0
+                    if score > 0.6:
+                        interval = 10.0     # very active thread
+                    elif score > 0.3:
+                        interval = 15.0     #Mildly active thread i think
+                    elif score > 0.1:
+                        interval = 30.0     # quite literally dead
+                    else:
+                        interval = 120.0     # types of thread that hav been dead for like 7 days smh
+
                     await asyncio.sleep(interval)
                     continue
 
@@ -415,7 +493,7 @@ async def refresh_cycle(thread_id_str: str):
 
                 try:
                     new_msg = await thread.send(embed=emb, files=files, view=make_jump_view(thread.guild.id, thread.id, entry.get("original_message_id")))
-                    # do NOT pin when reposting to avoid pin spam
+                    # Do not pin reposts to avoid multiple pins
                     entry["sticky_message_id"] = new_msg.id
                     entry["timestamp"] = iso_now()
                     save_data()
@@ -434,20 +512,37 @@ async def refresh_cycle(thread_id_str: str):
                 log(f"No permission to read history in thread {thread_id_str}; stopping task")
                 entry["active"] = False
                 save_data()
+                # Clean up EWMA on deactivation
+                activity_ewma.pop(thread_id_str, None)
+                last_activity.pop(thread_id_str, None)
                 break
             except Exception as e:
                 log(f"Unexpected error in refresh task for {thread_id_str}: {e}")
 
+        # decay EWMA once per cycle
+        ewma = activity_ewma.get(thread_id_str)
+        if ewma:
+            ewma.update(0.0)
+
+        # Dynamic interval based on activity
+        score = ewma.value if ewma else 0.0
+        if score > 0.6:
+            interval = 6.0      # very active thread
+        elif score > 0.3:
+            interval = 10.0     #Mildly active thread probably, wtv that terminology is supposed to mean
+        elif score > 0.1:
+            interval = 15.0     # quite literally dead
+        else:
+            interval = 30.0     # thread that has been dead for like 7 days smh
+
         await asyncio.sleep(interval)
-        if interval != REFRESH_INTERVAL:
-            interval = REFRESH_INTERVAL
 
 # ------------- Confirmation helper (embeds + reactions) -------------
 async def ask_replace_confirmation(author: discord.Member):
     emb = discord.Embed(
         title="Confirm Sticky Replacement",
-        description="⚠️ You are about to replace the existing sticky in the thread.\n\nReact with ✅ to confirm or ❌ to cancel.",
-        color=discord.Color.orange(),
+        description="⚠️ You are about to replace the existing sticky in the thread.\n\nReact with ✅ to confirm or ❌ to cancel.\n\n**If you did not attempt to replace the sticky, kindly ignore this message.**",
+        color=discord.Color.red(),
     )
     try:
         prompt = await author.send(embed=emb)
@@ -471,11 +566,11 @@ async def ask_replace_confirmation(author: discord.Member):
             await author.send(embed=confirm_emb)
             return True
         else:
-            cancel_emb = discord.Embed(description="❎ Cancelled Sticky Replacement.", color=discord.Color.red())
+            cancel_emb = discord.Embed(description="❌ Cancelled Sticky Replacement.", color=discord.Color.red())
             await author.send(embed=cancel_emb)
             return False
     except asyncio.TimeoutError:
-        timeout_emb = discord.Embed(description="⌛ Confirmation timed out. Your Sticky Replace Request has been Cancellled. Try Replacing the sticky again and react to the confirmation message within 10 seconds!.", color=discord.Color.red())
+        timeout_emb = discord.Embed(description="Confirmation timed out. Your Sticky Replacement Request has been Cancellled. Try Replacing the sticky again and react to the confirmation message within 10 seconds!", color=discord.Color.red())
         await author.send(embed=timeout_emb)
         return False
 
@@ -527,12 +622,28 @@ async def on_ready():
             log(f"Sticky thread {tid} not in parent channel; deactivated")
             continue
 
-        # delete old sticky message if present
+        # Determine whether we actually need to recreate the sticky.
+        # Only recreate if the thread has new activity (i.e. the last message is not the stored sticky).
         old_id = entry.get("sticky_message_id")
+        last_msg = None
+        try:
+            async for m in thread.history(limit=1):
+                last_msg = m
+                break
+        except Exception as e:
+            log(f"Could not read history for thread {tid} during resume: {e}")
+
+        # If the stored sticky is already the last message, just start the refresh task and skip reposting
+        if old_id and last_msg and last_msg.id == old_id:
+            tasks[tid] = asyncio.create_task(refresh_cycle(tid))
+            resumed += 1
+            log(f"♻️ Sticky already present as last message for thread {thread.name} ({tid}); skipping recreate")
+            continue
+
+        # Otherwise delete old sticky (if present) and recreate (send pinned + refresh)
         if old_id:
             await delete_msg_if_exists(thread, old_id)
 
-        # recreate sticky message (do not pin to avoid pin spam on restart)
         try:
             emb = make_solution_embed(entry.get("content", "(no text)"), entry.get("marked_by", "Unknown"))
             files = []
@@ -549,8 +660,22 @@ async def on_ready():
                 if file_objs:
                     emb.set_image(url=f"attachment://{file_objs[0].filename}")
                     files = file_objs
-            new_msg = await thread.send(embed=emb, files=files, view=make_jump_view(thread.guild.id, thread.id, entry.get("original_message_id")))
-            entry["sticky_message_id"] = new_msg.id
+
+            # send pinned master message
+            master_msg = await thread.send(embed=emb, files=files, view=make_jump_view(thread.guild.id, thread.id, entry.get("original_message_id")))
+            try:
+                await master_msg.pin()
+            except Exception as e:
+                log(f"Failed to pin resumed sticky in thread {tid}: {e}")
+
+            # send refresh message which will be cycled
+            try:
+                refresh_msg = await thread.send(embed=emb, files=files, view=make_jump_view(thread.guild.id, thread.id, entry.get("original_message_id")))
+            except Exception as e:
+                log(f"Failed to send refresh sticky in thread {tid}: {e}")
+                refresh_msg = master_msg
+
+            entry["sticky_message_id"] = refresh_msg.id
             entry["timestamp"] = iso_now()
             save_data()
             tasks[tid] = asyncio.create_task(refresh_cycle(tid))
@@ -598,14 +723,14 @@ async def sticky_cmd(ctx):
 
     tid = str(ch.id)
     existing = sticky_data.get(tid)
-    if existing and existing.get("active", False):
-        ok_confirm = await ask_replace_confirmation(ctx.author)
-        if not ok_confirm:
-            emb = discord.Embed(description="❎ Sticky replacement cancelled.", color=discord.Color.red())
-            return await ctx.send(embed=emb)
-        old_id = existing.get("sticky_message_id")
-        if old_id:
-            await delete_msg_if_exists(ch, old_id)
+    
+    # NEW: Validate that existing sticky actually exists
+    needs_replacement = await validate_existing_sticky(ch, existing, tid)
+    
+    if needs_replacement:
+        log(f"[-sticky typed] Rejecting sticky typed '-sticky' in thread {tid}; author={ctx.author.id} content={ctx.message.content!r} existing={existing}")
+        emb = discord.Embed(description="❌ This thread already has a sticky. You cannot replace it.", color=discord.Color.red())
+        return await ctx.send(embed=emb)
 
     created = await create_sticky(ch, replied, ctx.author.display_name, pin_first_time=True)
     if created:
@@ -618,18 +743,37 @@ async def sticky_cmd(ctx):
         emb = discord.Embed(description="✅ Sticky created and pinned.", color=discord.Color.green())
         return await ctx.send(embed=emb)
     else:
-        emb = discord.Embed(description="❌ Failed to create sticky. Check if your image is not supported by discord, Otherwise, permissions may be denied.", color=discord.Color.red())
+        emb = discord.Embed(description="❌ Failed to create sticky. Check if your image is not supported by Discord.\n\nSupported formats: **png, jpg, jpeg, gif, webp**", color=discord.Color.red())
         return await ctx.send(embed=emb)
 
 @bot.event
 async def on_message(message: discord.Message):
-    # process commands first for prefix commands
-    await bot.process_commands(message)
-
     if message.author.bot:
         return
 
+    # process commands first for prefix commands
+    await bot.process_commands(message)
+
+    # Track activity via events (no api calls otherwise im highkey cooked, this shyt lwk running on life support smh)
+    if (
+        not message.author.bot
+        and isinstance(message.channel, discord.Thread)
+        and message.channel.parent_id == PARENT_CHANNEL_ID
+    ):
+        tid = str(message.channel.id)
+
+        ewma = activity_ewma.setdefault(
+            tid,
+            EWMA(alpha=0.35)  # good balance for Discord traffic
+        )
+
+        ewma.update(1.0)  # activity spike
+        last_activity[tid] = time.monotonic()
+
     content = message.content.strip()
+    # If this message invoked the command framework for -sticky/-solution, avoid duplicate handling
+    if content in ("-sticky", "-solution") and message.reference:
+        return
     ch = message.channel
 
     # Permission protected commands (deny embed)
@@ -641,7 +785,7 @@ async def on_message(message: discord.Message):
             pass
         return
 
-        # Owner shutdown
+    # Owner shutdown
     if content == "-sd" and message.author.id == OWNER_ID:
         emb = discord.Embed(description="✌ Shutting down. cya!", color=discord.Color.red())
         try:
@@ -657,10 +801,8 @@ async def on_message(message: discord.Message):
             except Exception:
                 pass
 
-
         await bot.close()
         return
-
 
     # Owner console
     if content == "-console" and message.author.id == OWNER_ID:
@@ -673,8 +815,33 @@ async def on_message(message: discord.Message):
             pass
         return
 
+    # Owner EWMA debug
+    if content == "-ewma" and message.author.id == OWNER_ID:
+        lines = []
+        for tid, ewma in list(activity_ewma.items())[:20]:  # show first 20
+            score = ewma.value
+            thread_name = sticky_data.get(tid, {}).get("thread_id", tid)
+            lines.append(f"{thread_name}: {score:.3f}")
+        
+        desc = "\n".join(lines) if lines else "No active EWMA threads."
+        emb = discord.Embed(title="EWMA Scores (Activity)", description=desc, color=discord.Color.blue())
+        try:
+            await message.author.send(embed=emb)
+        except Exception:
+            pass
+        return
+    elif content == "-ewma" and message.author.id != OWNER_ID:
+        emb = make_permission_denied_embed(content, message.author)
+        try:
+            await message.channel.send(embed=emb)
+        except Exception:
+            pass
+        return
+
     # If bot is pinged anywhere (only valid behavior inside parent threads)
     if bot.user.mentioned_in(message):
+        if message.author.bot:
+            return
         # if not in relevant thread -> send permission/usage embed in-channel
         if not isinstance(ch, discord.Thread) or ch.parent_id != PARENT_CHANNEL_ID:
             # if ping outside allowed area, politely ignore (or optionally reply)
@@ -689,6 +856,14 @@ async def on_message(message: discord.Message):
                 await message.channel.send(embed=emb)
                 return
 
+            # Check if replying to the current sticky message
+            tid = str(ch.id)
+            existing = sticky_data.get(tid)
+            if existing and existing.get("sticky_message_id") == replied.id:
+                emb = discord.Embed(description="❌ You cannot sticky the sticky message itself. Please reply to the original message you want to mark as a solution.", color=discord.Color.red())
+                await message.reply(embed=emb, mention_author=False)
+                return
+
             # ---- pre-check attachments ----
             ok, err_emb = attachments_supported_and_list(replied)
             if not ok:
@@ -699,17 +874,18 @@ async def on_message(message: discord.Message):
                     await message.channel.send(embed=err_emb)
                 return
 
-            tid = str(ch.id)
             existing = sticky_data.get(tid)
-            if existing and existing.get("active", False):
-                ok_confirm = await ask_replace_confirmation(message.author)
-                if not ok_confirm:
-                    emb = discord.Embed(description="❎ Sticky replacement cancelled.", color=discord.Color.red())
-                    await message.reply(embed=emb)
-                    return
+            
+            # NEW: Validate that existing sticky actually exists
+            needs_replacement = await validate_existing_sticky(ch, existing, tid)
+            
+            if needs_replacement:
                 old_id = existing.get("sticky_message_id")
                 if old_id:
                     await delete_msg_if_exists(ch, old_id)
+                # Clean up EWMA on replacement
+                activity_ewma.pop(tid, None)
+                last_activity.pop(tid, None)
 
             created = await create_sticky(ch, replied, message.author.display_name, pin_first_time=True)
             if created:
@@ -749,6 +925,14 @@ async def on_message(message: discord.Message):
             await message.reply(embed=emb)
             return
 
+        # Check if replying to the current sticky message
+        tid = str(ch.id)
+        existing = sticky_data.get(tid)
+        if existing and existing.get("sticky_message_id") == replied.id:
+            emb = discord.Embed(description="❌ You cannot sticky the sticky message itself. Please reply to the original message you want to mark as a solution.", color=discord.Color.red())
+            await message.reply(embed=emb)
+            return
+
         # ---- pre-check attachments ----
         ok, err_emb = attachments_supported_and_list(replied)
         if not ok:
@@ -756,17 +940,16 @@ async def on_message(message: discord.Message):
             await message.reply(embed=err_emb)
             return
 
-        tid = str(ch.id)
         existing = sticky_data.get(tid)
-        if existing and existing.get("active", False):
-            ok_confirm = await ask_replace_confirmation(message.author)
-            if not ok_confirm:
-                emb = discord.Embed(description="❎ Sticky replacement cancelled.", color=discord.Color.red())
+        
+        # NEW: Validate that existing sticky actually exists
+        needs_replacement = await validate_existing_sticky(ch, existing, tid)
+        
+        if needs_replacement:
+                log(f"[ping-reply] Rejecting sticky on ping reply in thread {tid}; author={message.author.id} content={message.content!r} existing={existing}")
+                emb = discord.Embed(description="❌ This thread already has a sticky. You cannot replace it.", color=discord.Color.red())
                 await message.reply(embed=emb)
                 return
-            old_id = existing.get("sticky_message_id")
-            if old_id:
-                await delete_msg_if_exists(ch, old_id)
 
         created = await create_sticky(ch, replied, message.author.display_name, pin_first_time=True)
         if created:
@@ -796,6 +979,4 @@ if __name__ == "__main__":
         # non-fatal; just continue
         pass
     bot.run(TOKEN)
-
-
 
